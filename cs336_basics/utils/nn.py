@@ -26,7 +26,7 @@ def cross_entropy(inputs: torch.FloatTensor, targets: torch.LongTensor) -> torch
 def gradient_clipping(parameters, max_norm: float) -> None:
     """
     Clip gradients in-place to have a maximum combined L2 norm of `max_norm`.
-    Matches the semantics of `torch.nn.utils.clip_grad_norm_`.
+    Matches the semantics of `torch.nn.utils.clip_grad_norm_`
     """
 
     grads = [p.grad for p in parameters if getattr(p, "grad", None) is not None]

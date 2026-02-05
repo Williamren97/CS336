@@ -24,6 +24,7 @@ and the environment will be automatically solved and activated when necessary.
 
 ```sh
 uv run pytest
+uv run pytest -q
 ```
 
 Initially, all tests should fail with `NotImplementedError`s.
