@@ -1,124 +1,156 @@
+from __future__ import annotations
+
 import regex as re
-from typing import Dict, Tuple, Iterable, List
-from tqdm import tqdm
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
-from cs336_basics.utils.io import get_tokenizer_from_vocab_merges_path, GPT2_PRETOKENIZER_PATTERN
+from cs336_basics.utils.io import GPT2_PRETOKENIZER_PATTERN
 
-def get_pairs(ids: Iterable[int]) -> Iterable[Tuple[int, int]]:
-    """ Return a set of pairs in int ids """
-    pairs = set()
-    for pair in zip(ids, ids[1:]):
-        pairs.add(pair)
-    return pairs
 
-def update(ids: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
-    """ Update the ids by merging the pairs """
-    new_ids = []
+BytesPair = Tuple[bytes, bytes]
+
+
+def _get_pairs(tokens: Tuple[bytes, ...]) -> set[BytesPair]:
+    return set(zip(tokens, tokens[1:]))
+
+
+def _merge_pair(tokens: Tuple[bytes, ...], pair: BytesPair) -> Tuple[bytes, ...]:
+    """
+    Merge all occurrences of `pair` in `tokens` in a single pass.
+    """
+
+    if len(tokens) < 2:
+        return tokens
+
+    a, b = pair
+    out: list[bytes] = []
     i = 0
-    while i < len(ids):
-        curr_pair = tuple(ids[i:i+2])
-        if curr_pair == pair:
-            new_ids.append(new_id)
-            i += 1
+    while i < len(tokens):
+        if i < len(tokens) - 1 and tokens[i] == a and tokens[i + 1] == b:
+            out.append(a + b)
+            i += 2
         else:
-            new_ids.append(ids[i])
-        i += 1
-    return new_ids
+            out.append(tokens[i])
+            i += 1
+    return tuple(out)
 
-def _fix_vocab(vocab_i_to_b: Dict[int, bytes], vocab_b_to_i: Dict[str, bytes]):
-    """ Make sure all bytes are in the vocab """
-    for i in range(256):
-        byte = bytes([i])
-        if byte not in vocab_b_to_i:
-            vocab_b_to_i[byte] = len(vocab_b_to_i)
-            vocab_i_to_b[len(vocab_i_to_b)] = byte
-    return dict(int_to_byte=vocab_i_to_b, byte_to_int=vocab_b_to_i)
 
 class Tokenizer:
-    def __init__(self, vocab: Dict[int, bytes], merges: Iterable[Tuple[bytes, bytes]], special_tokens: Iterable[str]=None):
-        self.vocab = {}
-        self.vocab['int_to_byte'] = vocab
-        self.vocab['byte_to_int'] = {v: k for k, v in vocab.items()}
-        self.vocab = _fix_vocab(self.vocab['int_to_byte'], self.vocab['byte_to_int'])
+    """
+    GPT-2 style BPE tokenizer operating directly on bytes.
 
-        # reorganzie merges into pair -> new token id dict
-        self.merges = {}
-        for a, b in merges:
-            id_pair = (self.vocab['byte_to_int'][a], self.vocab['byte_to_int'][b])
-            self.merges[id_pair] = self.vocab['byte_to_int'][a+b]
-        
-        # add special tokens as string to id mapping
-        self.special_tokens = {}
+    The unit tests provide vocab/merges already converted back to raw bytes, so we
+    can implement BPE directly over byte tokens.
+    """
+
+    def __init__(
+        self,
+        vocab: Dict[int, bytes],
+        merges: Iterable[BytesPair],
+        special_tokens: Optional[Iterable[str]] = None,
+    ):
+        self.vocab: Dict[int, bytes] = dict(vocab)
+        self.byte_to_int: Dict[bytes, int] = {b: i for i, b in self.vocab.items()}
+
+        # Ensure all single-byte tokens exist (0..255).
+        for i in range(256):
+            b = bytes([i])
+            if b not in self.byte_to_int:
+                new_id = len(self.vocab)
+                self.vocab[new_id] = b
+                self.byte_to_int[b] = new_id
+
+        # BPE merge ranks: lower rank == higher priority.
+        self.merge_ranks: Dict[BytesPair, int] = {pair: rank for rank, pair in enumerate(merges)}
+
+        # Special tokens (string) -> token id
+        self.special_tokens: Dict[str, int] = {}
         if special_tokens:
-            special_tokens = sorted(special_tokens, key=len, reverse=True)
-            for token in special_tokens:
-                token_byte = token.encode("utf-8")
-                if token_byte not in self.vocab['byte_to_int']:
-                    self.vocab['byte_to_int'][token_byte] = len(self.vocab['byte_to_int'])
-                    self.vocab['int_to_byte'][len(self.vocab['int_to_byte'])] = token_byte
-                    self.special_tokens[token] = len(self.vocab['int_to_byte'])
+            # Longest-first to correctly handle overlaps.
+            for tok in sorted(list(special_tokens), key=len, reverse=True):
+                tok_b = tok.encode("utf-8")
+                if tok_b in self.byte_to_int:
+                    tok_id = self.byte_to_int[tok_b]
                 else:
-                    self.special_tokens[token] = self.vocab['byte_to_int'][token_byte]
-    
-    @classmethod
-    def from_files(cls, vocab_filepath, merges_filepath, special_tokens=None, **kwargs):
-        vocab, merges = get_tokenizer_from_vocab_merges_path(vocab_filepath, merges_filepath)
-        return cls(vocab, merges, special_tokens)
+                    tok_id = len(self.vocab)
+                    self.vocab[tok_id] = tok_b
+                    self.byte_to_int[tok_b] = tok_id
+                self.special_tokens[tok] = tok_id
+
+        # For splitting on specials.
+        self._special_split_re = None
+        if self.special_tokens:
+            pat = "(" + "|".join(re.escape(k) for k in sorted(self.special_tokens.keys(), key=len, reverse=True)) + ")"
+            self._special_split_re = re.compile(pat)
 
     @property
-    def vocab_size(self):
-        return len(self.vocab['int_to_byte'])
-    
-    def _encode_chunk(self, text: str) -> List[int]:
-        """
-        Encode the text without special tokens.
-        """
-        if text in self.special_tokens:
-            return [self.special_tokens[text]]
-        else:
-            text_chunks = re.findall(GPT2_PRETOKENIZER_PATTERN, text)
-            result = []
-            for chunk in text_chunks:
-                text_bytes = chunk.encode("utf-8")
-                ids = [self.vocab['byte_to_int'][bytes([b])] for b in chunk.encode("utf-8")]
-                while len(ids)>=2:
-                    pairs = get_pairs(ids)
-                    high_priority_pair = min(pairs, key=lambda pair: self.merges.get(pair, float('inf')))
-                    if high_priority_pair not in self.merges:
-                        break
-                    new_id = self.merges[high_priority_pair]
-                    ids = update(ids, high_priority_pair, new_id)
-                result.extend(ids)
-            return result
+    def vocab_size(self) -> int:
+        return len(self.vocab)
 
+    def _bpe(self, token_bytes: bytes) -> List[int]:
+        """
+        Run BPE over a single pretoken (bytes), returning token ids.
+        """
 
-    def encode(self, text: str, progress_bar: bool=False) -> List[int]:
+        # Start from single-byte symbols.
+        tokens: Tuple[bytes, ...] = tuple(bytes([b]) for b in token_bytes)
+        if len(tokens) == 0:
+            return []
+
+        while True:
+            pairs = _get_pairs(tokens)
+            if not pairs:
+                break
+
+            # Select best pair by rank
+            best_pair = None
+            best_rank = None
+            for p in pairs:
+                r = self.merge_ranks.get(p)
+                if r is None:
+                    continue
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+                    best_pair = p
+            if best_pair is None:
+                break
+
+            tokens = _merge_pair(tokens, best_pair)
+
+        # Map final byte tokens to ids (must exist in vocab).
+        return [self.byte_to_int[t] for t in tokens]
+
+    def encode(self, text: str, progress_bar: bool = False) -> List[int]:
         """
-        Encode the text into a list of token ids.
+        Encode full text to token ids, preserving special tokens as indivisible units.
         """
-        if self.special_tokens:
-            special_pattern = "(" + "|".join(re.escape(k) for k in self.special_tokens) + ")"
-            special_split_chunk = re.split(special_pattern, text)
+
+        # Split on special tokens (if any).
+        chunks: List[str]
+        if self._special_split_re is not None:
+            chunks = [c for c in self._special_split_re.split(text) if c != ""]
         else:
-            special_split_chunk = [text]
-        ids = []
-        for chunk in tqdm(special_split_chunk, disable=not progress_bar,
-                          desc=f"Encoding {len(special_split_chunk)} documents"):
-            ids += self._encode_chunk(chunk)
+            chunks = [text]
+
+        ids: List[int] = []
+        for chunk in chunks:
+            if chunk in self.special_tokens:
+                ids.append(self.special_tokens[chunk])
+                continue
+            # GPT-2 pretokenization
+            for pretoken in re.findall(GPT2_PRETOKENIZER_PATTERN, chunk):
+                ids.extend(self._bpe(pretoken.encode("utf-8")))
         return ids
-    
-    def encode_iterable(self, texts: Iterable[str]) -> Iterable[List[int]]:
+
+    def encode_iterable(self, texts: Iterable[str]) -> Iterator[int]:
         """
-        Encode the texts into a list of token ids.
+        Streaming encoder over an iterable of strings (e.g., a file object).
+        Yields token ids one-by-one.
         """
+
         for text in texts:
-            ids = self.encode(text)
-            for id in ids:
-                yield id
+            for _id in self.encode(text):
+                yield _id
 
     def decode(self, ids: List[int]) -> str:
-        """
-        Decode the token ids into the original text.
-        """
-        text_bytes = b''.join([self.vocab['int_to_byte'][i] for i in ids])
-        return text_bytes.decode("utf-8", errors="replace")
+        token_bytes = b"".join(self.vocab[i] for i in ids)
+        return token_bytes.decode("utf-8", errors="replace")
