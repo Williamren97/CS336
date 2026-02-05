@@ -18,7 +18,7 @@ def _find_pretokens(text: str):
 
 def _read_text_file(input_path: str, num_worker: int, special_tokens: Iterable[str]):
     """
-    Read the text file at the given path.
+    Read the text file at the given path..
     Return the text as pretoken frequency table.
     """
 
